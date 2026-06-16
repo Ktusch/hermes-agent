@@ -287,6 +287,14 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     if origin_platform and origin_chat_id:
+        # WebUI is not a delivery-capable platform — skip origin to
+        # prevent "unknown platform 'webui'" delivery errors later.
+        if origin_platform == "webui":
+            logger.debug(
+                "Cron origin skipped: platform '%s' is not delivery-capable",
+                origin_platform,
+            )
+            return None
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID") or None
         if thread_id:
             logger.debug(
