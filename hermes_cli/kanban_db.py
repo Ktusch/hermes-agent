@@ -5089,6 +5089,59 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+def _rescue_scratch_files(wp: Path, task_id: str) -> None:
+    """Rescue plausible output files from a scratch workspace before deletion.
+
+    Walks *wp* and copies any file matching ``*.md``, ``*.csv``, or ``*.json``
+    with size > 500 bytes to ``~/workspace/50_Research/scratch-recovery/``,
+    prefixed with the task id so origin is traceable.
+
+    This is a safety net for the documented durable-path policy — workers
+    SHOULD save output to a long-lived path, but when they don't, the file
+    survives workspace cleanup instead of being silently lost.
+    Best-effort — never raises.
+    """
+    try:
+        home = Path.home()
+        recovery = home / "workspace" / "50_Research" / "scratch-recovery"
+        recovery.mkdir(parents=True, exist_ok=True)
+
+        rescued = 0
+        from collections.abc import Iterator
+
+        def _walk_safe(wp: Path) -> Iterator[Path]:
+            try:
+                for p in wp.rglob("*"):
+                    yield p
+            except (PermissionError, OSError):
+                pass
+
+        for p in _walk_safe(wp):
+            if p.suffix.lower() not in (".md", ".csv", ".json"):
+                continue
+            try:
+                if p.stat().st_size < 500:
+                    continue
+            except OSError:
+                continue
+            dest = recovery / f"{task_id}--{p.name}"
+            try:
+                import shutil
+                shutil.copy2(p, dest)
+                rescued += 1
+            except OSError:
+                continue
+
+        if rescued:
+            _log.info(
+                "Rescued %d file(s) from scratch workspace %s (task %s) "
+                "→ %s",
+                rescued, wp, task_id, recovery,
+            )
+    except Exception:
+        pass  # best-effort — never block cleanup
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -5138,6 +5191,12 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # completion would unconditionally ``shutil.rmtree`` that path
             # and silently delete the user's source data.
             if _is_managed_scratch_path(wp):
+                # SAFETY NET: before destroying the scratch workspace, rescue
+                # any plausible output files (.md, .csv, .json >500 bytes) so
+                # they survive even when workers ignore the durable-path policy.
+                # Files land in ~/workspace/50_Research/scratch-recovery/ with
+                # a task-id prefix for traceability (#t_de69964a).
+                _rescue_scratch_files(wp, task_id)
                 shutil.rmtree(wp, ignore_errors=True)
                 _log.debug("Removed scratch workspace: %s", wp)
             else:

@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -1166,6 +1167,41 @@ def _handle_create(args: dict, **kw) -> str:
     _inherit_project = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
+        # DURABLE PATH GUARD: when no workspace was specified and the
+        # task title/body suggests it will produce output files, upgrade
+        # from scratch (ephemeral, deleted on completion) to a dir: workspace
+        # under ~/workspace/50_Research/kanban-output/ so files survive even
+        # when the caller forgets to set a durable workspace (#t_de69964a).
+        _title = str(args.get("title", "") or "")
+        _body = str(args.get("body", "") or "")
+        _combined = (_title + " " + _body).lower()
+        _output_keywords = {
+            # Strong action signals — almost always mean file creation
+            "write to", "create file", "save to", "output to",
+            "save as",
+            # Moderate action signals — often produce files
+            "generate", "produce", "render ", "export ",
+            # Explicit output nouns
+            "deliverable",
+            # Specific formats rarely referenced passively
+            ".pdf", ".png", ".drawio",
+        }
+        if any(kw in _combined for kw in _output_keywords):
+            workspace_kind = "dir"
+            _ts = str(int(time.time()))
+            _fallback_path = os.path.join(
+                os.path.expanduser("~"),
+                "workspace", "50_Research", "kanban-output",
+                f"auto-{_ts}",
+            )
+            workspace_path = _fallback_path
+            logger.warning(
+                "Task %r body suggests file output — auto-upgraded workspace "
+                "from 'scratch' to 'dir' at %s. Pass workspace_kind='scratch' "
+                "explicitly to suppress.",
+                str(args.get("title", "") or ""),
+                _fallback_path,
+            )
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
