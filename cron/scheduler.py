@@ -500,6 +500,17 @@ _terminal_cwd_lock = _ReadWriteLock()
 
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent parallel pool."""
+    # Pre-load unittest.mock in the main thread so it's available in
+    # sys.modules for all worker threads.  CPython's import machinery
+    # can intermittently fail to resolve stdlib modules (unittest.mock
+    # in particular) under ThreadPoolExecutor dispatch — the import
+    # lock + thread-local path state can produce ModuleNotFoundError
+    # for modules that are trivially importable on the main thread.
+    # Pre-loading sidesteps the race entirely.
+    try:
+        import unittest.mock  # noqa: F401
+    except Exception:
+        pass
     global _parallel_pool, _parallel_pool_max_workers
     if _parallel_pool is None or _parallel_pool_max_workers != max_workers:
         if _parallel_pool is not None:
