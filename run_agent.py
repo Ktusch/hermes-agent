@@ -4201,9 +4201,9 @@ class AIAgent:
         Prior bug: getattr(client, "is_closed", False) returned the bound method,
         which is always truthy, causing unnecessary client recreation on every call.
         """
-        from unittest.mock import Mock
-
-        if isinstance(client, Mock):
+        # Use duck-typing instead of importing unittest.mock to
+        # avoid ImportError in ThreadPoolExecutor dispatch (cron jobs)
+        if hasattr(client, "assert_called"):
             return False
 
         is_closed_attr = getattr(client, "is_closed", None)
@@ -4408,12 +4408,12 @@ class AIAgent:
         return copilot_request_headers(is_agent_turn=True, is_vision=is_vision)
 
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
-        from unittest.mock import Mock
-
+        # Use duck-typing instead of importing unittest.mock to
+        # avoid ImportError in ThreadPoolExecutor dispatch (cron jobs)
         primary_client = self._ensure_primary_openai_client(reason=reason)
         if self.provider == "moa":
             return primary_client
-        if isinstance(primary_client, Mock):
+        if hasattr(primary_client, "assert_called"):
             return primary_client
         with self._openai_client_lock():
             request_kwargs = dict(self._client_kwargs)
