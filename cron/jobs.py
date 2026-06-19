@@ -149,6 +149,11 @@ def _jobs_lock():
 # into output writes/deletes.
 _IMMUTABLE_JOB_FIELDS = frozenset({"id"})
 
+# Lock for multi-profile operations that temporarily re-target the
+# module globals (CRON_DIR, JOBS_FILE, OUTPUT_DIR). Mirrors the
+# _CRON_PROFILE_LOCK in hermes_cli/web_server.py.
+_PROFILE_RETARGET_LOCK = threading.Lock()
+
 
 def _job_output_dir(job_id: str) -> Path:
     """Resolve a job's output directory, rejecting any path-escape attempt.
@@ -932,6 +937,166 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
     return jobs
+
+
+# =============================================================================
+# Multi-profile cron discovery
+# =============================================================================
+
+def _set_cron_globals(
+    cron_dir: Path,
+    jobs_file: Path | None = None,
+    output_dir: Path | None = None,
+) -> None:
+    """Re-target the cron module globals to a specific profile directory.
+
+    When *cron_dir* is the only argument, JOBS_FILE and OUTPUT_DIR are
+    derived from it.  When all three are passed, they are assigned directly
+    (used by the restore path after ``finally``).
+    """
+    global CRON_DIR, JOBS_FILE, OUTPUT_DIR  # noqa: PLW0602
+    CRON_DIR = cron_dir
+    JOBS_FILE = jobs_file if jobs_file is not None else cron_dir / "jobs.json"
+    OUTPUT_DIR = output_dir if output_dir is not None else cron_dir / "output"
+
+
+@contextlib.contextmanager
+def with_profile_cron(cron_dir: str | Path):
+    """Context manager that re-targets cron globals to *cron_dir* and restores on exit.
+
+    Usage::
+
+        with with_profile_cron(job["cron_dir"]):
+            advance_next_run(job["id"])
+    """
+    new_dir = Path(cron_dir)
+    with _PROFILE_RETARGET_LOCK:
+        old_cron_dir = CRON_DIR
+        old_jobs_file = JOBS_FILE
+        old_output_dir = OUTPUT_DIR
+        try:
+            _set_cron_globals(new_dir)
+            yield
+        finally:
+            _set_cron_globals(old_cron_dir, old_jobs_file, old_output_dir)
+
+
+def _get_profile_cron_dirs() -> Dict[str, Path]:
+    """Discover all cron directories across profiles.
+
+    Returns a mapping of ``profile_name`` → ``cron_dir`` for:
+    - The default profile (``~/.hermes/cron/``)
+    - Every named profile under ``~/.hermes/profiles/<name>/cron/``
+    """
+    from hermes_constants import get_default_hermes_root
+
+    root = get_default_hermes_root()
+    dirs: Dict[str, Path] = {}
+
+    default_cron = root / "cron"
+    if default_cron.is_dir():
+        dirs["default"] = default_cron
+
+    profiles_root = root / "profiles"
+    if profiles_root.is_dir():
+        for entry in sorted(profiles_root.iterdir()):
+            if entry.is_dir() and not entry.name.startswith("."):
+                cron_dir = entry / "cron"
+                if cron_dir.is_dir():
+                    dirs[entry.name] = cron_dir
+
+    return dirs
+
+
+def _load_profile_jobs(cron_dir: Path) -> List[Dict[str, Any]]:
+    """Load jobs.json from a profile-specific cron directory.
+
+    Returns an empty list when the directory doesn't exist or the file is
+    missing/unreadable.
+    """
+    jobs_file = cron_dir / "jobs.json"
+    if not jobs_file.exists():
+        return []
+    try:
+        with open(jobs_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        logger.warning("Failed to read %s", jobs_file)
+        return []
+    if isinstance(data, dict):
+        return data.get("jobs", [])
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def list_jobs_all_profiles(
+    include_disabled: bool = False,
+) -> List[Dict[str, Any]]:
+    """List jobs from ALL profile cron databases with profile annotations.
+
+    Each returned job dict includes:
+      - ``profile``: profile name (``"default"`` for the default profile)
+      - ``is_default_profile``: ``True`` for the default profile
+      - ``cron_dir``: absolute path to the profile's cron directory
+
+    Jobs are normalized via ``_normalize_job_record()``, which computes
+    ``next_run_at`` based on the schedule.  Cross-profile duplicate job IDs
+    are NOT deduplicated — a job with the same ``id`` may appear more than
+    once when it exists in multiple profile databases.
+    """
+    all_jobs: List[Dict[str, Any]] = []
+    for profile_name, cron_dir in _get_profile_cron_dirs().items():
+        raw_jobs = _load_profile_jobs(cron_dir)
+        for job in raw_jobs:
+            if not include_disabled and not job.get("enabled", True):
+                continue
+            normalized = _normalize_job_record(dict(job))
+            normalized["profile"] = profile_name
+            normalized["is_default_profile"] = profile_name == "default"
+            normalized["cron_dir"] = str(cron_dir)
+            all_jobs.append(normalized)
+    return all_jobs
+
+
+def get_due_jobs_all_profiles() -> List[Dict[str, Any]]:
+    """Get all jobs that are due to run across ALL profile cron databases.
+
+    Behaves like :func:`get_due_jobs` but scans every profile directory.
+    Each returned job dict is annotated with ``profile``, ``is_default_profile``,
+    and ``cron_dir`` so the caller (typically the scheduler) can target writes
+    back to the correct profile's ``jobs.json``.
+
+    Fast-forward logic (stale recurring jobs) and one-shot grace windows are
+    applied per-profile, per-job — identical semantics to the single-profile
+    ``get_due_jobs`` but discovery is multi-profile.
+    """
+    due: List[Dict[str, Any]] = []
+    for profile_name, cron_dir in _get_profile_cron_dirs().items():
+        jobs_file = cron_dir / "jobs.json"
+        if not jobs_file.exists():
+            continue
+        # Temporarily re-target module globals so load_jobs / save_jobs
+        # operate on THIS profile's database.  Serialize with a lock so
+        # concurrent ticks or API calls don't step on each other.
+        with _PROFILE_RETARGET_LOCK:
+            old_cron_dir = CRON_DIR
+            old_jobs_file = JOBS_FILE
+            old_output_dir = OUTPUT_DIR
+            try:
+                new_cron_dir = cron_dir.resolve()
+                # Re-point module globals for this profile
+                _set_cron_globals(new_cron_dir)
+                # Use the existing single-profile get_due_jobs
+                profile_jobs = get_due_jobs()
+            finally:
+                _set_cron_globals(old_cron_dir, old_jobs_file, old_output_dir)
+        for job in profile_jobs:
+            job["profile"] = profile_name
+            job["is_default_profile"] = profile_name == "default"
+            job["cron_dir"] = str(cron_dir)
+            due.append(job)
+    return due
 
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
