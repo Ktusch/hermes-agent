@@ -1,0 +1,25 @@
+From 8dc6aa5ec282c5a42c2ea8620d856696183f45f6 Mon Sep 17 00:00:00 2001
+From: Kristian T <35293262+Ktusch@users.noreply.github.com>
+Date: Fri, 19 Jun 2026 11:33:06 +0200
+Subject: [PATCH] fix(cron): pre-load unittest.mock before ThreadPoolExecutor
+ dispatch
+
+---
+ cron/scheduler.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 359069966..2ddbbc5c6 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1783,6 +1783,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+         # env passthrough registrations) when the cron run hops into the worker
+         # thread used for inactivity timeout monitoring.
+         _cron_context = contextvars.copy_context()
++        import unittest.mock  # noqa: F401 — pre-load before ThreadPoolExecutor dispatch
+         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+         _inactivity_timeout = False
+         try:
+-- 
+2.54.0
+
