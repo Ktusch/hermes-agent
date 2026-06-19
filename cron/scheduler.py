@@ -203,7 +203,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, get_due_jobs_all_profiles, mark_job_run, save_job_output, advance_next_run, with_profile_cron, CRON_DIR
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -284,8 +284,9 @@ def _get_hermes_home() -> Path:
 
 def _get_lock_paths() -> tuple[Path, Path]:
     """Resolve cron lock paths at call time so profile/env changes are honored."""
-    hermes_home = _get_hermes_home()
-    lock_dir = hermes_home / "cron"
+    from hermes_constants import get_default_hermes_root
+    root = get_default_hermes_root()
+    lock_dir = root / "cron"
     return lock_dir, lock_dir / ".tick.lock"
 
 
@@ -2069,7 +2070,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     try:
         success, output, final_response, error = run_job(job)
 
-        output_file = save_job_output(job["id"], output)
+        cron_dir = job.get("cron_dir", str(CRON_DIR))
+        with with_profile_cron(cron_dir):
+            output_file = save_job_output(job["id"], output)
         if verbose:
             logger.info("Output saved to: %s", output_file)
 
@@ -2100,12 +2103,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        with with_profile_cron(cron_dir):
+            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        mark_job_run(job["id"], False, str(e))
+        cron_dir = job.get("cron_dir", str(CRON_DIR))
+        with with_profile_cron(cron_dir):
+            mark_job_run(job["id"], False, str(e))
         return False
 
 
@@ -2160,7 +2166,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         return 0
 
     try:
-        due_jobs = get_due_jobs()
+        due_jobs = get_due_jobs_all_profiles()
 
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
@@ -2175,7 +2181,8 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         # bumping next_run_at forward so the grace window never expires.
         # mark_job_run() overwrites next_run_at on completion.
         for job in due_jobs:
-            advance_next_run(job["id"])
+            with with_profile_cron(job.get("cron_dir", CRON_DIR)):
+                advance_next_run(job["id"])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
