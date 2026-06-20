@@ -58,10 +58,10 @@ def _cron_api(**kwargs):
 
 
 def cron_list(show_all: bool = False):
-    """List all scheduled jobs."""
-    from cron.jobs import list_jobs
+    """List all scheduled jobs across all profiles."""
+    from cron.jobs import list_jobs_all_profiles
 
-    jobs = list_jobs(include_disabled=show_all)
+    jobs = list_jobs_all_profiles(include_disabled=show_all)
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -80,6 +80,8 @@ def cron_list(show_all: bool = False):
         schedule = job.get("schedule_display", job.get("schedule", {}).get("value", "?"))
         state = job.get("state", "scheduled" if job.get("enabled", True) else "paused")
         next_run = job.get("next_run_at", "?")
+        profile = job.get("profile", "?")
+        is_default = job.get("is_default_profile", False)
 
         # `repeat` may be present-but-null in the job record (e.g. a one-shot
         # job persisted with "repeat": null), so coalesce to {} rather than
@@ -106,6 +108,8 @@ def cron_list(show_all: bool = False):
 
         print(f"  {color(job_id, Colors.YELLOW)} {status}")
         print(f"    Name:      {name}")
+        if not is_default:
+            print(f"    Profile:   {color(profile, Colors.MAGENTA)}")
         print(f"    Schedule:  {schedule}")
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")

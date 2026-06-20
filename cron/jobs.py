@@ -134,6 +134,11 @@ def _jobs_lock():
 # into output writes/deletes.
 _IMMUTABLE_JOB_FIELDS = frozenset({"id"})
 
+# Lock for multi-profile operations that temporarily re-target the
+# module globals (CRON_DIR, JOBS_FILE, OUTPUT_DIR). Mirrors the
+# _CRON_PROFILE_LOCK in hermes_cli/web_server.py.
+_PROFILE_RETARGET_LOCK = threading.Lock()
+
 
 def _job_output_dir(job_id: str) -> Path:
     """Resolve a job's output directory, rejecting any path-escape attempt.
@@ -822,6 +827,166 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
+# =============================================================================
+# Multi-profile cron discovery
+# =============================================================================
+
+def _set_cron_globals(
+    cron_dir: Path,
+    jobs_file: Path | None = None,
+    output_dir: Path | None = None,
+) -> None:
+    """Re-target the cron module globals to a specific profile directory.
+
+    When *cron_dir* is the only argument, JOBS_FILE and OUTPUT_DIR are
+    derived from it.  When all three are passed, they are assigned directly
+    (used by the restore path after ``finally``).
+    """
+    global CRON_DIR, JOBS_FILE, OUTPUT_DIR  # noqa: PLW0602
+    CRON_DIR = cron_dir
+    JOBS_FILE = jobs_file if jobs_file is not None else cron_dir / "jobs.json"
+    OUTPUT_DIR = output_dir if output_dir is not None else cron_dir / "output"
+
+
+@contextlib.contextmanager
+def with_profile_cron(cron_dir: str | Path):
+    """Context manager that re-targets cron globals to *cron_dir* and restores on exit.
+
+    Usage::
+
+        with with_profile_cron(job["cron_dir"]):
+            advance_next_run(job["id"])
+    """
+    new_dir = Path(cron_dir)
+    with _PROFILE_RETARGET_LOCK:
+        old_cron_dir = CRON_DIR
+        old_jobs_file = JOBS_FILE
+        old_output_dir = OUTPUT_DIR
+        try:
+            _set_cron_globals(new_dir)
+            yield
+        finally:
+            _set_cron_globals(old_cron_dir, old_jobs_file, old_output_dir)
+
+
+def _get_profile_cron_dirs() -> Dict[str, Path]:
+    """Discover all cron directories across profiles.
+
+    Returns a mapping of ``profile_name`` → ``cron_dir`` for:
+    - The default profile (``~/.hermes/cron/``)
+    - Every named profile under ``~/.hermes/profiles/<name>/cron/``
+    """
+    from hermes_constants import get_default_hermes_root
+
+    root = get_default_hermes_root()
+    dirs: Dict[str, Path] = {}
+
+    default_cron = root / "cron"
+    if default_cron.is_dir():
+        dirs["default"] = default_cron
+
+    profiles_root = root / "profiles"
+    if profiles_root.is_dir():
+        for entry in sorted(profiles_root.iterdir()):
+            if entry.is_dir() and not entry.name.startswith("."):
+                cron_dir = entry / "cron"
+                if cron_dir.is_dir():
+                    dirs[entry.name] = cron_dir
+
+    return dirs
+
+
+def _load_profile_jobs(cron_dir: Path) -> List[Dict[str, Any]]:
+    """Load jobs.json from a profile-specific cron directory.
+
+    Returns an empty list when the directory doesn't exist or the file is
+    missing/unreadable.
+    """
+    jobs_file = cron_dir / "jobs.json"
+    if not jobs_file.exists():
+        return []
+    try:
+        with open(jobs_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        logger.warning("Failed to read %s", jobs_file)
+        return []
+    if isinstance(data, dict):
+        return data.get("jobs", [])
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def list_jobs_all_profiles(
+    include_disabled: bool = False,
+) -> List[Dict[str, Any]]:
+    """List jobs from ALL profile cron databases with profile annotations.
+
+    Each returned job dict includes:
+      - ``profile``: profile name (``"default"`` for the default profile)
+      - ``is_default_profile``: ``True`` for the default profile
+      - ``cron_dir``: absolute path to the profile's cron directory
+
+    Jobs are normalized via ``_normalize_job_record()``, which computes
+    ``next_run_at`` based on the schedule.  Cross-profile duplicate job IDs
+    are NOT deduplicated — a job with the same ``id`` may appear more than
+    once when it exists in multiple profile databases.
+    """
+    all_jobs: List[Dict[str, Any]] = []
+    for profile_name, cron_dir in _get_profile_cron_dirs().items():
+        raw_jobs = _load_profile_jobs(cron_dir)
+        for job in raw_jobs:
+            if not include_disabled and not job.get("enabled", True):
+                continue
+            normalized = _normalize_job_record(dict(job))
+            normalized["profile"] = profile_name
+            normalized["is_default_profile"] = profile_name == "default"
+            normalized["cron_dir"] = str(cron_dir)
+            all_jobs.append(normalized)
+    return all_jobs
+
+
+def get_due_jobs_all_profiles() -> List[Dict[str, Any]]:
+    """Get all jobs that are due to run across ALL profile cron databases.
+
+    Behaves like :func:`get_due_jobs` but scans every profile directory.
+    Each returned job dict is annotated with ``profile``, ``is_default_profile``,
+    and ``cron_dir`` so the caller (typically the scheduler) can target writes
+    back to the correct profile's ``jobs.json``.
+
+    Fast-forward logic (stale recurring jobs) and one-shot grace windows are
+    applied per-profile, per-job — identical semantics to the single-profile
+    ``get_due_jobs`` but discovery is multi-profile.
+    """
+    due: List[Dict[str, Any]] = []
+    for profile_name, cron_dir in _get_profile_cron_dirs().items():
+        jobs_file = cron_dir / "jobs.json"
+        if not jobs_file.exists():
+            continue
+        # Temporarily re-target module globals so load_jobs / save_jobs
+        # operate on THIS profile's database.  Serialize with a lock so
+        # concurrent ticks or API calls don't step on each other.
+        with _PROFILE_RETARGET_LOCK:
+            old_cron_dir = CRON_DIR
+            old_jobs_file = JOBS_FILE
+            old_output_dir = OUTPUT_DIR
+            try:
+                new_cron_dir = cron_dir.resolve()
+                # Re-point module globals for this profile
+                _set_cron_globals(new_cron_dir)
+                # Use the existing single-profile get_due_jobs
+                profile_jobs = get_due_jobs()
+            finally:
+                _set_cron_globals(old_cron_dir, old_jobs_file, old_output_dir)
+        for job in profile_jobs:
+            job["profile"] = profile_name
+            job["is_default_profile"] = profile_name == "default"
+            job["cron_dir"] = str(cron_dir)
+            due.append(job)
+    return due
+
+
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
@@ -976,6 +1141,9 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                # Clear any external-fire claim so a re-armed recurring job can
+                # be claimed again on its next fire (Phase 4C CAS).
+                job["fire_claim"] = None
                 
                 # Increment completed count
                 if job.get("repeat"):
@@ -1054,6 +1222,71 @@ def advance_next_run(job_id: str) -> bool:
                     save_jobs(jobs)
                     return True
                 return False
+        return False
+
+
+def _machine_id() -> str:
+    """Stable-ish identifier for claim attribution/debugging (NOT correctness).
+
+    Uses ``HERMES_MACHINE_ID`` if set, else hostname + pid. The CAS correctness
+    comes from the file lock + the fresh-claim check, not from this value.
+    """
+    explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
+    if explicit:
+        return explicit
+    try:
+        import socket
+        host = socket.gethostname()
+    except Exception:
+        host = "unknown"
+    return f"{host}:{os.getpid()}"
+
+
+def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+    """Atomically claim a job for a single external 'fire' (multi-machine
+    at-most-once). Returns True iff THIS caller won the claim.
+
+    Used by the external-provider fire path (``CronScheduler.fire_due``) when an
+    external scheduler (Chronos) signals a job is due across N gateway replicas:
+    exactly one wins. Single-machine deployments always win.
+
+    Under the file lock: reject if the job is missing/disabled/paused. If a
+    fresh claim (younger than ``claim_ttl_seconds``) already exists, lose.
+    Otherwise stamp a ``fire_claim`` and, for recurring jobs, advance
+    ``next_run_at`` (mirrors ``advance_next_run``'s at-most-once bump so a stale
+    re-delivery for the old time can't re-fire). One-shots keep ``next_run_at``
+    but the fresh ``fire_claim`` blocks a duplicate retry for the same fire.
+    ``mark_job_run`` clears the claim on completion so a re-armed recurring job
+    is claimable again next fire.
+
+    The stale-claim TTL means a machine that crashed after claiming but before
+    completing doesn't wedge the job forever — after the TTL another fire can
+    reclaim it.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            if not job.get("enabled", True) or job.get("state") == "paused":
+                return False
+            now = _hermes_now()
+            existing = job.get("fire_claim")
+            if existing:
+                try:
+                    claimed_at = _ensure_aware(datetime.fromisoformat(existing["at"]))
+                    if (now - claimed_at).total_seconds() < claim_ttl_seconds:
+                        return False  # someone holds a fresh claim
+                except Exception:
+                    pass  # malformed claim → overwrite
+            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            kind = job.get("schedule", {}).get("kind")
+            if kind in {"cron", "interval"}:
+                nxt = compute_next_run(job["schedule"], now.isoformat())
+                if nxt:
+                    job["next_run_at"] = nxt
+            save_jobs(jobs)
+            return True
         return False
 
 
