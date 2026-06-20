@@ -1863,23 +1863,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
-        # Pre-load unittest.mock in the main thread so it's available in
-        # sys.modules for all worker threads.  CPython's import machinery
-        # can intermittently fail to resolve stdlib modules (unittest.mock
-        # in particular) under ThreadPoolExecutor dispatch — the import
-        # lock + thread-local path state can produce ModuleNotFoundError
-        # for modules that are trivially importable on the main thread.
-        # Pre-loading sidesteps the race entirely.
-        try:
-            import unittest.mock  # noqa: F401
-        except Exception:
-            pass
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        import unittest.mock  # noqa: F401 — pre-load before ThreadPoolExecutor dispatch
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
         try:
