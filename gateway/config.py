@@ -1520,10 +1520,24 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     api_server_cors_origins = os.getenv("API_SERVER_CORS_ORIGINS", "")
     api_server_port = os.getenv("API_SERVER_PORT")
     api_server_host = os.getenv("API_SERVER_HOST")
-    if api_server_enabled or api_server_key:
-        if Platform.API_SERVER not in config.platforms:
+
+    # Respect config.yaml enabled flag: API_SERVER_KEY alone must not override
+    # enabled:false.  Only enable when the env var explicitly says so, or when
+    # config.yaml already enabled the platform AND a key is provided.
+    _config_has_api = Platform.API_SERVER in config.platforms
+    _config_api_enabled = _config_has_api and config.platforms[Platform.API_SERVER].enabled
+    _should_enable = api_server_enabled or (_config_api_enabled and bool(api_server_key))
+
+    if api_server_key and not _should_enable:
+        logger.warning(
+            "API_SERVER_KEY is set but api_server is disabled in config.yaml. "
+            "Set API_SERVER_ENABLED=true or enable api_server in config.yaml to activate."
+        )
+
+    if _should_enable or api_server_key:
+        if not _config_has_api:
             config.platforms[Platform.API_SERVER] = PlatformConfig()
-        config.platforms[Platform.API_SERVER].enabled = True
+        config.platforms[Platform.API_SERVER].enabled = _should_enable
         if api_server_key:
             config.platforms[Platform.API_SERVER].extra["key"] = api_server_key
         if api_server_cors_origins:
