@@ -2007,18 +2007,23 @@ def get_running_pid(
     pid_path: Optional[Path] = None,
     *,
     cleanup_stale: bool = True,
+    expected_home: Optional[Path] = None,
 ) -> Optional[int]:
     """Return the PID of a running gateway instance, or ``None``.
 
     Checks the PID file and verifies the process is actually alive.
     Cleans up stale PID files automatically.
+
+    When ``expected_home`` is provided, runtime-status fallback scans
+    are scoped to that specific HERMES_HOME — preventing cross-profile
+    PID confusion when multiple Hermes gateways run on the same host.
     """
     resolved_pid_path = pid_path or _get_pid_path()
     resolved_lock_path = _get_gateway_lock_path(resolved_pid_path)
     lock_active = is_gateway_runtime_lock_active(resolved_lock_path)
     if not lock_active:
         if pid_path is None:
-            runtime_pid = get_runtime_status_running_pid()
+            runtime_pid = get_runtime_status_running_pid(expected_home=expected_home)
             if runtime_pid is not None:
                 return runtime_pid
         _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
@@ -2040,12 +2045,12 @@ def get_running_pid(
         if recorded_start is not None and current_start is not None and current_start != recorded_start:
             continue
 
-        if _record_matches_live_gateway_pid(record, pid):
+        if _record_matches_live_gateway_pid(record, pid, expected_home=expected_home):
             return pid
 
     _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
     if pid_path is None:
-        runtime_pid = get_runtime_status_running_pid()
+        runtime_pid = get_runtime_status_running_pid(expected_home=expected_home)
         if runtime_pid is not None:
             return runtime_pid
     return None

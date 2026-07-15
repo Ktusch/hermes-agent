@@ -4737,7 +4737,7 @@ def _guard_existing_gateway_process_conflict(replace: bool = False) -> None:
     try:
         from gateway.status import get_running_pid
 
-        pid = get_running_pid()
+        pid = get_running_pid(expected_home=get_hermes_home())
     except Exception:
         logger.debug("Existing-gateway process probe failed", exc_info=True)
         return

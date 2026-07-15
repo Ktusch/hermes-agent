@@ -23519,7 +23519,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         remove_pid_file,
         terminate_pid,
     )
-    existing_pid = get_running_pid()
+    existing_pid = get_running_pid(expected_home=get_hermes_home())
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
             existing_start_time = get_process_start_time(existing_pid)
@@ -23886,7 +23886,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # cleanly before touching any external service.
     import atexit
     from gateway.status import write_pid_file, remove_pid_file, get_running_pid
-    _current_pid = get_running_pid()
+    _current_pid = get_running_pid(expected_home=get_hermes_home())
     if _current_pid is not None and _current_pid != os.getpid():
         logger.error(
             "Another gateway instance (PID %d) started during our startup. "
