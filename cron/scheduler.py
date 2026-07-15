@@ -3493,6 +3493,17 @@ def run_job(
                     "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
                 )
 
+        # Pre-load unittest.mock in the main thread so it's available in
+        # sys.modules for all worker threads.  CPython's import machinery
+        # can intermittently fail to resolve stdlib modules (unittest.mock
+        # in particular) under ThreadPoolExecutor dispatch — the import
+        # lock + thread-local path state can produce ModuleNotFoundError
+        # for modules that are trivially importable on the main thread.
+        # Pre-loading sidesteps the race entirely.
+        try:
+            import unittest.mock  # noqa: F401
+        except Exception:
+            pass
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
